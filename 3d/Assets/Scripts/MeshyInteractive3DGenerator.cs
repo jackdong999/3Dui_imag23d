@@ -17,7 +17,10 @@ public class MeshyInteractive3DGenerator : MonoBehaviour
     public string meshyApiKey = "PASTE_YOUR_MESHY_API_KEY_HERE";
 
     [Header("UI (drag references from your Canvas)")]
-    public Button pickAndGenerateButton;
+    [Tooltip("Single image: 1 image -> 3D model")]
+    public Button pickAndGenerateButton;          // 单图按钮
+    [Tooltip("Multi image: 1~4 images -> 3D model")]
+    public Button pickAndGenerateMultiButton;     // 多图按钮
     public TextMeshProUGUI statusTMP;
 
     [Header("Spawn Settings")]
@@ -31,7 +34,7 @@ public class MeshyInteractive3DGenerator : MonoBehaviour
     public GameObject handGrabWrapperPrefab;
 
     [Header("Persistence")]
-    [Tooltip("App 启动时自动加载最后一次保存的模型（如果有）。")]
+    [Tooltip("Load last saved model on app start (if any).")]
     public bool loadLastOnStart = true;
 
     [Header("Debug")]
@@ -40,13 +43,15 @@ public class MeshyInteractive3DGenerator : MonoBehaviour
     // ==== Meshy OpenAPI ====
     const string BaseUrl = "https://api.meshy.ai/openapi/v1";
 
-    // 保存本地 GLB 路径的 key & 列表文件
+    // Local GLB storage
     const string LastGlbPathKey = "Meshy_LastGlbPath";
     const string ModelsDirName = "meshy_models";
     const string ModelListFileName = "meshy_model_list.json";
 
     [Serializable] class CreateResp { public string result; }
+
     [Serializable] class ModelUrls { public string glb; }
+
     [Serializable]
     class TaskResp
     {
@@ -62,21 +67,57 @@ public class MeshyInteractive3DGenerator : MonoBehaviour
         public List<string> files = new List<string>();
     }
 
+    // Multi-image create request body
+    [Serializable]
+    class MultiImageCreateReq
+    {
+        public string[] image_urls;   // 1~4 data URIs
+        public string ai_model;
+        public string topology;
+        public int target_polycount;
+        public string symmetry_mode;
+        public bool should_remesh;
+        public bool should_texture;
+        public bool enable_pbr;
+        public bool is_a_t_pose;
+        public string texture_prompt;
+        public string texture_image_url;
+    }
+    // Retexture request body
+    [Serializable]
+    class RetextureCreateReq
+    {
+        public string input_task_id;
+        public string ai_model;
+        public string text_style_prompt;
+        public string image_style_url;
+        public bool enable_original_uv;
+        public bool enable_pbr;
+    }
+
+    int _nextSavedModelIndex = 0;
+    bool _isGenerating = false;
+
+    // 记录最后一次生成的根节点，用于贴图完成后替换
+    GameObject _lastSpawnRoot;
+
     void Awake()
     {
         if (pickAndGenerateButton != null)
             pickAndGenerateButton.onClick.AddListener(OnPickButton);
-    }
-    public void OnLoadAllButton()
-    {
-        // 按钮点击时调用，内部直接调用我们写好的加载函数
-        LoadAllSavedModels();
+
+        if (pickAndGenerateMultiButton != null)
+            pickAndGenerateMultiButton.onClick.AddListener(OnPickMultiButton);
     }
 
-    // 把 glTFast 的 Shader 换成 URP 的 Lit / Unlit
+    public void OnLoadAllButton()
+    {
+        StartCoroutine(CoLoadNextSavedModel());
+    }
+
+    // Switch glTFast shaders to URP Lit / Unlit (if you use URP in the future)
     void ConvertGlTFastMaterialsToURP(GameObject root)
     {
-        // 找 URP 的标准 Shader（前提是你的项目确实是 URP 管线）
         var litShader = Shader.Find("Universal Render Pipeline/Lit");
         var unlitShader = Shader.Find("Universal Render Pipeline/Unlit");
 
@@ -97,25 +138,20 @@ public class MeshyInteractive3DGenerator : MonoBehaviour
 
                 string shaderName = m.shader.name;
 
-                // glTFast 自带的 shader / ShaderGraph 名里一般都会带 "glTF"
                 if (shaderName.Contains("glTF"))
                 {
                     bool isUnlit =
                         shaderName.IndexOf("unlit", StringComparison.OrdinalIgnoreCase) >= 0;
 
                     Shader target = (isUnlit && unlitShader != null) ? unlitShader : litShader;
-
-                    // 因为 glTFast 把属性名做得跟 URP Lit 一样，所以直接换 shader，贴图/颜色会跟着迁移
                     m.shader = target;
                 }
             }
         }
     }
 
-
     void DumpMaterials(GameObject root)
     {
-        // 进来先打一条，确认函数被调用
         Debug.Log("[MeshyTest] DumpMaterials CALLED");
 
         var rends = root.GetComponentsInChildren<Renderer>(true);
@@ -136,7 +172,6 @@ public class MeshyInteractive3DGenerator : MonoBehaviour
                     continue;
                 }
 
-                // 一定要这样写，不能 mat.shader ? ...
                 var shaderName = (mat.shader != null) ? mat.shader.name : "<no shader>";
 
                 Texture mainTex = null;
@@ -160,11 +195,9 @@ public class MeshyInteractive3DGenerator : MonoBehaviour
         }
     }
 
-
-
     IEnumerator Start()
     {
-        // 1) 启动时先试着从本地读“最后一个模型”
+        // Load last saved model on startup
         if (loadLastOnStart)
         {
             string lastPath = PlayerPrefs.GetString(LastGlbPathKey, string.Empty);
@@ -198,13 +231,22 @@ public class MeshyInteractive3DGenerator : MonoBehaviour
 #endif
     }
 
+    // ================== Single image: geometry -> grey model -> retexture ==================
+
     public void OnPickButton()
     {
 #if UNITY_ANDROID && !UNITY_EDITOR
+        if (_isGenerating)
+        {
+            Log("A generation task is already running. Please wait until it finishes.");
+            return;
+        }
+
         if (NativeFilePicker.IsFilePickerBusy()) return;
+
         NativeFilePicker.PickFile(OnFilePicked, new string[] { "image/*" });
 #else
-        Log("Please test on a Quest device (the system file picker is not available in the Editor).");
+        Log("Please test on a Quest/Android device (system file picker is not available in the Editor).");
 #endif
     }
 
@@ -215,12 +257,20 @@ public class MeshyInteractive3DGenerator : MonoBehaviour
             Log("Selection cancelled.");
             return;
         }
-        StartCoroutine(Pipeline(path));
+
+        if (_isGenerating)
+        {
+            Log("A generation task is already running. Please wait until it finishes.");
+            return;
+        }
+
+        StartCoroutine(PipelineSingleGreyThenTexture(path));
     }
 
-    // ============ Main pipeline ============
-    IEnumerator Pipeline(string imagePath)
+    IEnumerator PipelineSingleGreyThenTexture(string imagePath)
     {
+        _isGenerating = true;
+
         Log("Reading image...");
         byte[] bytes = null;
         try
@@ -230,67 +280,151 @@ public class MeshyInteractive3DGenerator : MonoBehaviour
         catch (Exception e)
         {
             Log("Read failed: " + e.Message);
+            _isGenerating = false;
             yield break;
         }
 
         string dataUri = ToDataUri(bytes, imagePath);
 
-        // 1) Create job
-        Log("Creating Meshy job...");
-        string taskId = null;
-        yield return CreateImageTo3DTask(
+        // Step 1: image-to-3d geometry only (no texture)
+        Log("Creating Meshy job (single image, geometry only)...");
+        string geomTaskId = null;
+        yield return CreateImageTo3DGeometryTask(
             dataUri,
-            id => taskId = id,
+            id => geomTaskId = id,
             err => Log(err)
         );
-        if (string.IsNullOrEmpty(taskId)) yield break;
-        Log($"Job created: {taskId}. Polling...");
 
-        // 2) Poll until ready
+        if (string.IsNullOrEmpty(geomTaskId))
+        {
+            _isGenerating = false;
+            yield break;
+        }
+
+        Log($"Geometry job created: {geomTaskId}. Polling base mesh...");
         string glbUrl = null;
-        yield return PollUntilReady(
-            taskId,
+        yield return PollUntilReadyImageTo3D(
+            geomTaskId,
             (status, progress, url) =>
             {
-                Log($"Status: {status}   Progress: {progress}%");
+                Log($"[Geometry] Status: {status} Progress: {progress}%");
                 if (!string.IsNullOrEmpty(url)) glbUrl = url;
             },
             err => Log(err),
             3f
         );
+
         if (string.IsNullOrEmpty(glbUrl))
         {
-            Log("No GLB download URL returned.");
+            Log("No GLB download URL returned for geometry.");
+            _isGenerating = false;
             yield break;
         }
 
-        // 2.5) 把 GLB 下载到本地（生成一个新的 glb 文件，并加入列表）
-        StartCoroutine(SaveGlbAndRegister(glbUrl));
-
-        // 3) 直接从网络 URL 加载（带贴图）
-        Log("Loading model from URL...");
+        // Load grey model
+        Log("Loading base mesh (grey model)...");
         var t = LoadGlbFromUrl(glbUrl);
         while (!t.IsCompleted) yield return null;
+
         if (t.IsFaulted)
         {
-            Log("Load failed: " + t.Exception);
+            Log("Load base mesh failed: " + t.Exception);
             Debug.LogException(t.Exception);
+            _isGenerating = false;
             yield break;
         }
 
         var rawModel = t.Result;
 
-        // 4) 统一做：归一化尺寸 + 放到面前 + HandGrab 包装（并隐藏 wrapper 自己的 Cube）
-        SetupSpawnedModel(rawModel);
+        // Turn into grey model (remove textures, set grey color)
+        MakeModelGrey(rawModel);
 
-        Log("Done! Model loaded (hand grab + multi-save).");
+        SetupSpawnedModel(rawModel);
+        GameObject greyRoot = _lastSpawnRoot;
+        Log("Base mesh ready. Starting texturing in background...");
+
+        // Step 2: retexture based on same task id (same geometry, new textures)
+        string retexTaskId = null;
+        yield return CreateRetextureTaskFromTaskId(
+            geomTaskId,
+            "photo-realistic, high detail, keep original base colors and materials, no extra decorations, no logos, no text, no symbols, clean surface, game-ready PBR textures",
+            id => retexTaskId = id,
+            err => Log(err)
+        );
+
+        if (string.IsNullOrEmpty(retexTaskId))
+        {
+            Log("Retexture creation failed. Keeping base mesh only.");
+            _isGenerating = false;
+            yield break;
+        }
+
+        Log($"Retexture task created: {retexTaskId}. Polling textured model...");
+
+        string texturedGlbUrl = null;
+        yield return PollUntilReadyRetexture(
+            retexTaskId,
+            (status, progress, url) =>
+            {
+                Log($"[Retexture] Status: {status} Progress: {progress}%");
+                if (!string.IsNullOrEmpty(url)) texturedGlbUrl = url;
+            },
+            err => Log(err),
+            3f
+        );
+
+        if (string.IsNullOrEmpty(texturedGlbUrl))
+        {
+            Log("No GLB download URL returned for retexture. Keeping base mesh only.");
+            _isGenerating = false;
+            yield break;
+        }
+
+        // Save final textured version
+        StartCoroutine(SaveGlbAndRegister(texturedGlbUrl));
+
+        Log("Loading textured model from URL...");
+        var t2 = LoadGlbFromUrl(texturedGlbUrl);
+        while (!t2.IsCompleted) yield return null;
+
+        if (t2.IsFaulted)
+        {
+            Log("Load textured model failed: " + t2.Exception);
+            Debug.LogException(t2.Exception);
+            _isGenerating = false;
+            yield break;
+        }
+
+        var texturedModel = t2.Result;
+
+        // Replace grey model with textured one
+        ReplaceLastSpawnedModel(texturedModel, greyRoot);
+
+        Log("Done! Grey model has been replaced by textured model.");
+        _isGenerating = false;
     }
 
-    // ============ HTTP ============
-    IEnumerator CreateImageTo3DTask(string dataUri, Action<string> onOk, Action<string> onErr)
+    // Single-image: geometry-only image-to-3d
+    IEnumerator CreateImageTo3DGeometryTask(string dataUri, Action<string> onOk, Action<string> onErr)
     {
+        // Higher polycount for more detailed mesh (you can tweak between 40000~120000)
+        int targetPoly = 80000;
+
         string json =
-            $"{{\"image_url\":\"{dataUri}\",\"enable_pbr\":true,\"should_remesh\":true,\"should_texture\":true}}";
+            "{" +
+            $"\"image_url\":\"{dataUri}\"," +
+            "\"ai_model\":\"meshy-5\"," +          // geometry 仍然用 meshy-5（保证和 retexture 兼容）
+            "\"topology\":\"triangle\"," +
+            $"\"target_polycount\":{targetPoly}," +
+            "\"symmetry_mode\":\"off\"," +        // 关闭对称，避免奇怪对称 artifacts
+            "\"should_remesh\":true," +           // 启用 remesh，遵守 target_polycount
+            "\"should_texture\":false," +         // 只要几何，不要纹理
+            "\"enable_pbr\":false," +
+            "\"is_a_t_pose\":false" +
+            "}";
+
+        Debug.Log("[Meshy] ImageTo3D geometry request json: " + json);
+
         byte[] body = Encoding.UTF8.GetBytes(json);
 
         using (var req = new UnityWebRequest($"{BaseUrl}/image-to-3d", "POST"))
@@ -304,21 +438,27 @@ public class MeshyInteractive3DGenerator : MonoBehaviour
 
             if (req.result != UnityWebRequest.Result.Success)
             {
-                onErr?.Invoke($"Create failed: {req.responseCode} {req.error}\n{req.downloadHandler.text}");
+                onErr?.Invoke($"Create image-to-3d (geometry) failed: {req.responseCode} {req.error}\n{req.downloadHandler.text}");
                 yield break;
             }
 
             var resp = JsonUtility.FromJson<CreateResp>(req.downloadHandler.text);
             if (string.IsNullOrEmpty(resp?.result))
             {
-                onErr?.Invoke("Create succeeded but no taskId returned.");
+                onErr?.Invoke("Create image-to-3d succeeded but no taskId returned.");
                 yield break;
             }
             onOk?.Invoke(resp.result);
         }
     }
 
-    IEnumerator PollUntilReady(string taskId, Action<string, int, string> onProgress, Action<string> onErr, float intervalSec)
+
+    IEnumerator PollUntilReadyImageTo3D(
+        string taskId,
+        Action<string, int, string> onProgress,
+        Action<string> onErr,
+        float intervalSec
+    )
     {
         while (true)
         {
@@ -330,7 +470,7 @@ public class MeshyInteractive3DGenerator : MonoBehaviour
 
                 if (req.result != UnityWebRequest.Result.Success)
                 {
-                    onErr?.Invoke($"Poll failed: {req.responseCode} {req.error}");
+                    onErr?.Invoke($"Poll image-to-3d failed: {req.responseCode} {req.error}");
                     yield break;
                 }
 
@@ -354,7 +494,445 @@ public class MeshyInteractive3DGenerator : MonoBehaviour
         }
     }
 
-    // ============ 保存多个 GLB ============
+    // ================== Multi-image: geometry -> grey model -> retexture ==================
+
+    public void OnPickMultiButton()
+    {
+        Debug.Log("[MeshyMulti] OnPickMultiButton CLICKED");
+
+        if (Application.platform != RuntimePlatform.Android)
+        {
+            Log("Multi-image feature should be tested on a Quest/Android device (current platform: " + Application.platform + ").");
+            return;
+        }
+
+        if (_isGenerating)
+        {
+            Log("A generation task is already running. Please wait until it finishes.");
+            return;
+        }
+
+        if (NativeFilePicker.IsFilePickerBusy())
+        {
+            Debug.Log("[MeshyMulti] File picker is busy");
+            return;
+        }
+
+        if (NativeFilePicker.CanPickMultipleFiles())
+        {
+            NativeFilePicker.PickMultipleFiles(OnFilesPickedMulti, new string[] { "image/*" });
+        }
+        else
+        {
+            NativeFilePicker.PickFile(path =>
+            {
+                if (string.IsNullOrEmpty(path))
+                {
+                    Log("Selection cancelled.");
+                    return;
+                }
+
+                if (_isGenerating)
+                {
+                    Log("A generation task is already running. Please wait until it finishes.");
+                    return;
+                }
+
+                StartCoroutine(PipelineMultiGreyThenTexture(new List<string> { path }));
+            }, new string[] { "image/*" });
+        }
+    }
+
+    void OnFilesPickedMulti(string[] paths)
+    {
+        if (paths == null || paths.Length == 0)
+        {
+            Log("Selection cancelled.");
+            return;
+        }
+
+        if (_isGenerating)
+        {
+            Log("A generation task is already running. Please wait until it finishes.");
+            return;
+        }
+
+        var list = new List<string>();
+        foreach (var p in paths)
+        {
+            if (!string.IsNullOrEmpty(p))
+                list.Add(p);
+        }
+
+        if (list.Count == 0)
+        {
+            Log("No valid files selected.");
+            return;
+        }
+
+        if (list.Count > 4)
+            list = list.GetRange(0, 4);
+
+        StartCoroutine(PipelineMultiGreyThenTexture(list));
+    }
+
+    IEnumerator PipelineMultiGreyThenTexture(List<string> imagePaths)
+    {
+        _isGenerating = true;
+
+        if (imagePaths == null || imagePaths.Count == 0)
+        {
+            Log("No images selected.");
+            _isGenerating = false;
+            yield break;
+        }
+
+        Log("Reading images...");
+        var dataUris = new List<string>();
+
+        foreach (var imagePath in imagePaths)
+        {
+            if (string.IsNullOrEmpty(imagePath)) continue;
+
+            byte[] bytes = null;
+            try
+            {
+                bytes = File.ReadAllBytes(imagePath);
+            }
+            catch (Exception e)
+            {
+                Log("Read failed: " + e.Message);
+                _isGenerating = false;
+                yield break;
+            }
+
+            string dataUri = ToDataUri(bytes, imagePath);
+            dataUris.Add(dataUri);
+        }
+
+        if (dataUris.Count == 0)
+        {
+            Log("No valid images read.");
+            _isGenerating = false;
+            yield break;
+        }
+
+        // Step 1: multi-image geometry only
+        Log("Creating Meshy job (multi-image, geometry only)...");
+        string geomTaskId = null;
+        yield return CreateMultiImageTo3DGeometryTask(
+            dataUris,
+            id => geomTaskId = id,
+            err => Log(err)
+        );
+
+        if (string.IsNullOrEmpty(geomTaskId))
+        {
+            _isGenerating = false;
+            yield break;
+        }
+
+        Log($"Multi-image geometry job created: {geomTaskId}. Polling base mesh...");
+        string glbUrl = null;
+        yield return PollUntilReadyMultiImageTo3D(
+            geomTaskId,
+            (status, progress, url) =>
+            {
+                Log($"[Multi Geometry] Status: {status} Progress: {progress}%");
+                if (!string.IsNullOrEmpty(url)) glbUrl = url;
+            },
+            err => Log(err),
+            3f
+        );
+
+        if (string.IsNullOrEmpty(glbUrl))
+        {
+            Log("No GLB download URL returned for multi-image geometry.");
+            _isGenerating = false;
+            yield break;
+        }
+
+        Log("Loading multi-image base mesh (grey model)...");
+        var t = LoadGlbFromUrl(glbUrl);
+        while (!t.IsCompleted) yield return null;
+
+        if (t.IsFaulted)
+        {
+            Log("Load multi-image base mesh failed: " + t.Exception);
+            Debug.LogException(t.Exception);
+            _isGenerating = false;
+            yield break;
+        }
+
+        var rawModel = t.Result;
+        MakeModelGrey(rawModel);
+        SetupSpawnedModel(rawModel);
+        GameObject greyRoot = _lastSpawnRoot;
+        Log("Multi-image base mesh ready. Starting texturing in background...");
+
+        // Step 2: retexture
+        // Note: official docs do not explicitly say multi-image tasks are valid input_task_id for retexture.
+        // This may need to be verified in practice.
+        string retexTaskId = null;
+        yield return CreateRetextureTaskFromTaskId(
+            geomTaskId,
+            "photo-realistic, high detail, keep original base colors and materials, no extra decorations, no logos, no text, no symbols, clean surface, game-ready PBR textures",
+            id => retexTaskId = id,
+            err => Log(err)
+        );
+
+        if (string.IsNullOrEmpty(retexTaskId))
+        {
+            Log("Retexture creation failed for multi-image. Keeping base mesh only.");
+            _isGenerating = false;
+            yield break;
+        }
+
+        Log($"Multi-image retexture task created: {retexTaskId}. Polling textured model...");
+
+        string texturedGlbUrl = null;
+        yield return PollUntilReadyRetexture(
+            retexTaskId,
+            (status, progress, url) =>
+            {
+                Log($"[Multi Retexture] Status: {status} Progress: {progress}%");
+                if (!string.IsNullOrEmpty(url)) texturedGlbUrl = url;
+            },
+            err => Log(err),
+            3f
+        );
+
+        if (string.IsNullOrEmpty(texturedGlbUrl))
+        {
+            Log("No GLB download URL returned for multi-image retexture. Keeping base mesh only.");
+            _isGenerating = false;
+            yield break;
+        }
+
+        StartCoroutine(SaveGlbAndRegister(texturedGlbUrl));
+
+        Log("Loading multi-image textured model from URL...");
+        var t2 = LoadGlbFromUrl(texturedGlbUrl);
+        while (!t2.IsCompleted) yield return null;
+
+        if (t2.IsFaulted)
+        {
+            Log("Load multi-image textured model failed: " + t2.Exception);
+            Debug.LogException(t2.Exception);
+            _isGenerating = false;
+            yield break;
+        }
+
+        var texturedModel = t2.Result;
+        ReplaceLastSpawnedModel(texturedModel, greyRoot);
+
+        Log("Done! Multi-image grey model has been replaced by textured model.");
+
+        _isGenerating = false;
+    }
+
+    IEnumerator CreateMultiImageTo3DGeometryTask(
+      List<string> dataUris,
+      Action<string> onOk,
+      Action<string> onErr
+  )
+    {
+        if (dataUris == null || dataUris.Count == 0)
+        {
+            onErr?.Invoke("No images provided for multi-image task.");
+            yield break;
+        }
+
+        if (dataUris.Count > 4)
+            dataUris = dataUris.GetRange(0, 4);
+
+        // Higher polycount for more detailed mesh
+        int targetPoly = 80000;
+
+        var payload = new MultiImageCreateReq
+        {
+            image_urls = dataUris.ToArray(),
+            ai_model = "meshy-5",           // geometry 仍然用 meshy-5
+            topology = "triangle",
+            target_polycount = targetPoly,
+            symmetry_mode = "off",          // 关闭对称
+            should_remesh = true,           // 按 target_polycount remesh
+            should_texture = false,         // 只要几何
+            enable_pbr = false,
+            is_a_t_pose = false,
+            texture_prompt = null,
+            texture_image_url = null
+        };
+
+        string json = JsonUtility.ToJson(payload);
+        Debug.Log("[Meshy] Multi-image geometry request json: " + json);
+
+        byte[] body = Encoding.UTF8.GetBytes(json);
+
+        using (var req = new UnityWebRequest($"{BaseUrl}/multi-image-to-3d", "POST"))
+        {
+            req.uploadHandler = new UploadHandlerRaw(body);
+            req.downloadHandler = new DownloadHandlerBuffer();
+            req.SetRequestHeader("Authorization", $"Bearer {meshyApiKey}");
+            req.SetRequestHeader("Content-Type", "application/json");
+
+            yield return req.SendWebRequest();
+
+            if (req.result != UnityWebRequest.Result.Success)
+            {
+                onErr?.Invoke($"Create multi-image geometry failed: {req.responseCode} {req.error}\n{req.downloadHandler.text}");
+                yield break;
+            }
+
+            var resp = JsonUtility.FromJson<CreateResp>(req.downloadHandler.text);
+            if (string.IsNullOrEmpty(resp?.result))
+            {
+                onErr?.Invoke("Create multi-image geometry succeeded but no taskId returned.");
+                yield break;
+            }
+
+            onOk?.Invoke(resp.result);
+        }
+    }
+
+
+    IEnumerator PollUntilReadyMultiImageTo3D(
+        string taskId,
+        Action<string, int, string> onProgress,
+        Action<string> onErr,
+        float intervalSec
+    )
+    {
+        while (true)
+        {
+            using (var req = UnityWebRequest.Get($"{BaseUrl}/multi-image-to-3d/{taskId}"))
+            {
+                req.SetRequestHeader("Authorization", $"Bearer {meshyApiKey}");
+                req.downloadHandler = new DownloadHandlerBuffer();
+                yield return req.SendWebRequest();
+
+                if (req.result != UnityWebRequest.Result.Success)
+                {
+                    onErr?.Invoke($"Poll multi-image-to-3d failed: {req.responseCode} {req.error}");
+                    yield break;
+                }
+
+                var task = JsonUtility.FromJson<TaskResp>(req.downloadHandler.text);
+                string status = task?.status ?? "UNKNOWN";
+                int progress = task?.progress ?? 0;
+                string glb = task?.model_urls?.glb;
+
+                onProgress?.Invoke(status, progress, glb);
+
+                if (status == "SUCCEEDED" && !string.IsNullOrEmpty(glb))
+                    yield break;
+
+                if (status == "FAILED" || status == "CANCELED")
+                {
+                    onErr?.Invoke($"Task {status}");
+                    yield break;
+                }
+            }
+
+            yield return new WaitForSeconds(intervalSec);
+        }
+    }
+
+    // ================== Retexture (for both single & multi) ==================
+
+    IEnumerator CreateRetextureTaskFromTaskId(
+       string inputTaskId,
+       string textStylePrompt,
+       Action<string> onOk,
+       Action<string> onErr
+   )
+    {
+        var payload = new RetextureCreateReq
+        {
+            input_task_id = inputTaskId,
+            // Use the most advanced model for texturing (Meshy 6 Preview)
+            ai_model = "latest",
+            text_style_prompt = textStylePrompt,
+            image_style_url = null,
+            enable_original_uv = true,
+            enable_pbr = true
+        };
+
+        string json = JsonUtility.ToJson(payload);
+        Debug.Log("[Meshy] Retexture request json: " + json);
+
+        byte[] body = Encoding.UTF8.GetBytes(json);
+
+        using (var req = new UnityWebRequest($"{BaseUrl}/retexture", "POST"))
+        {
+            req.uploadHandler = new UploadHandlerRaw(body);
+            req.downloadHandler = new DownloadHandlerBuffer();
+            req.SetRequestHeader("Authorization", $"Bearer {meshyApiKey}");
+            req.SetRequestHeader("Content-Type", "application/json");
+
+            yield return req.SendWebRequest();
+
+            if (req.result != UnityWebRequest.Result.Success)
+            {
+                onErr?.Invoke($"Create retexture failed: {req.responseCode} {req.error}\n{req.downloadHandler.text}");
+                yield break;
+            }
+
+            var resp = JsonUtility.FromJson<CreateResp>(req.downloadHandler.text);
+            if (string.IsNullOrEmpty(resp?.result))
+            {
+                onErr?.Invoke("Create retexture succeeded but no taskId returned.");
+                yield break;
+            }
+
+            onOk?.Invoke(resp.result);
+        }
+    }
+
+
+    IEnumerator PollUntilReadyRetexture(
+        string taskId,
+        Action<string, int, string> onProgress,
+        Action<string> onErr,
+        float intervalSec
+    )
+    {
+        while (true)
+        {
+            using (var req = UnityWebRequest.Get($"{BaseUrl}/retexture/{taskId}"))
+            {
+                req.SetRequestHeader("Authorization", $"Bearer {meshyApiKey}");
+                req.downloadHandler = new DownloadHandlerBuffer();
+                yield return req.SendWebRequest();
+
+                if (req.result != UnityWebRequest.Result.Success)
+                {
+                    onErr?.Invoke($"Poll retexture failed: {req.responseCode} {req.error}");
+                    yield break;
+                }
+
+                var task = JsonUtility.FromJson<TaskResp>(req.downloadHandler.text);
+                string status = task?.status ?? "UNKNOWN";
+                int progress = task?.progress ?? 0;
+                string glb = task?.model_urls?.glb;
+
+                onProgress?.Invoke(status, progress, glb);
+
+                if (status == "SUCCEEDED" && !string.IsNullOrEmpty(glb))
+                    yield break;
+
+                if (status == "FAILED" || status == "CANCELED")
+                {
+                    onErr?.Invoke($"Task {status}");
+                    yield break;
+                }
+            }
+
+            yield return new WaitForSeconds(intervalSec);
+        }
+    }
+
+    // ============ Save multiple GLBs ============
 
     string GetModelsDir()
     {
@@ -411,17 +989,14 @@ public class MeshyInteractive3DGenerator : MonoBehaviour
             string dir = GetModelsDir();
             if (!Directory.Exists(dir)) Directory.CreateDirectory(dir);
 
-            // 用时间戳生成不重复的文件名
             string fileName = $"meshy_{DateTime.Now:yyyyMMdd_HHmmss}.glb";
             string filePath = Path.Combine(dir, fileName);
             File.WriteAllBytes(filePath, data);
 
-            // 更新列表
             var list = LoadModelList();
             list.files.Add(filePath);
             SaveModelList(list);
 
-            // 仍然记住“最后一个模型”方便下次快速加载
             PlayerPrefs.SetString(LastGlbPathKey, filePath);
             PlayerPrefs.Save();
 
@@ -460,14 +1035,14 @@ public class MeshyInteractive3DGenerator : MonoBehaviour
         return root;
     }
 
-    // ============ 一次性加载所有历史模型（可选调用） ============
+    // ============ Load saved models one by one (each click loads one) ============
 
     public void LoadAllSavedModels()
     {
-        StartCoroutine(CoLoadAllSavedModels());
+        StartCoroutine(CoLoadNextSavedModel());
     }
 
-    IEnumerator CoLoadAllSavedModels()
+    IEnumerator CoLoadNextSavedModel()
     {
         var list = LoadModelList();
         if (list.files == null || list.files.Count == 0)
@@ -476,28 +1051,82 @@ public class MeshyInteractive3DGenerator : MonoBehaviour
             yield break;
         }
 
-        Log($"Loading {list.files.Count} saved models...");
+        if (_nextSavedModelIndex >= list.files.Count)
+            _nextSavedModelIndex = 0;
 
-        foreach (var path in list.files)
+        string path = list.files[_nextSavedModelIndex];
+        int humanIndex = _nextSavedModelIndex + 1;
+        _nextSavedModelIndex++;
+
+        if (!File.Exists(path))
         {
-            if (!File.Exists(path))
-                continue;
-
-            var t = LoadGlbFromFile(path);
-            while (!t.IsCompleted) yield return null;
-
-            if (!t.IsFaulted)
-            {
-                var rawModel = t.Result;
-                SetupSpawnedModel(rawModel);
-            }
+            Log("Saved model not found: " + path);
+            yield break;
         }
 
-        Log("All saved models loaded.");
+        Log($"Loading saved model {humanIndex}/{list.files.Count} ...");
+
+        var t = LoadGlbFromFile(path);
+        while (!t.IsCompleted) yield return null;
+
+        if (!t.IsFaulted)
+        {
+            var rawModel = t.Result;
+            SetupSpawnedModel(rawModel);
+            Log($"Saved model {humanIndex}/{list.files.Count} loaded.");
+        }
+        else
+        {
+            Log("Failed to load saved model: " + t.Exception);
+        }
     }
 
-    // 统一处理：归一化尺寸 + HandGrab 包装 + 放到玩家前方 + 隐藏壳里的可见方块
-    // 统一处理：归一化尺寸 + HandGrab 包装 + 放到玩家前方 + 隐藏壳里的可见方块
+    // ============ Grey model helper + replace helper ============
+
+    void MakeModelGrey(GameObject root)
+    {
+        var rends = root.GetComponentsInChildren<Renderer>(true);
+        foreach (var r in rends)
+        {
+            var mats = r.materials; // instance materials
+            foreach (var m in mats)
+            {
+                if (m == null) continue;
+
+                if (m.HasProperty("_BaseMap"))
+                    m.SetTexture("_BaseMap", null);
+                if (m.HasProperty("_MainTex"))
+                    m.SetTexture("_MainTex", null);
+
+                if (m.HasProperty("_BaseColor"))
+                    m.SetColor("_BaseColor", Color.gray);
+                else if (m.HasProperty("_Color"))
+                    m.SetColor("_Color", Color.gray);
+            }
+        }
+    }
+
+    // New overload: explicitly say which root to destroy
+    void ReplaceLastSpawnedModel(GameObject newRawModel, GameObject oldRoot)
+    {
+        // Spawn the new model (this will update _lastSpawnRoot)
+        SetupSpawnedModel(newRawModel);
+
+        // Destroy the specific old root we passed in
+        if (oldRoot != null)
+        {
+            Destroy(oldRoot);
+        }
+    }
+
+    // Backward-compatible overload (if you still want to use it somewhere)
+    void ReplaceLastSpawnedModel(GameObject newRawModel)
+    {
+        ReplaceLastSpawnedModel(newRawModel, _lastSpawnRoot);
+    }
+
+
+    // 统一处理：归一化尺寸 + HandGrab 包装 + 放到玩家前方 + 隐藏壳子的可见方块
     void SetupSpawnedModel(GameObject rawModel)
     {
         Debug.Log("[MeshyTest] SetupSpawnedModel CALLED");
@@ -505,14 +1134,12 @@ public class MeshyInteractive3DGenerator : MonoBehaviour
         var b0 = ComputeWorldBounds(rawModel);
         Debug.Log($"[MeshyInteractive3DGenerator] Bounds before normalize: {b0.size}");
 
-        // 归一化尺寸
         NormalizeBounds(rawModel, targetSizeMeters);
-
-        // 把所有 glTF shader 换成 URP Lit / Unlit
-        ConvertGlTFastMaterialsToURP(rawModel);
 
         var b1 = ComputeWorldBounds(rawModel);
         Debug.Log($"[MeshyInteractive3DGenerator] Bounds after normalize: {b1.size}");
+
+        GameObject rootForState = null;
 
         if (handGrabWrapperPrefab != null)
         {
@@ -527,20 +1154,22 @@ public class MeshyInteractive3DGenerator : MonoBehaviour
 
             PlaceObject(wrapper.transform);
             EnsureBoundsCollider(wrapper.gameObject);
+
+            rootForState = wrapper;
         }
         else
         {
             PlaceObject(rawModel.transform);
             EnsureBoundsCollider(rawModel.gameObject);
+
+            rootForState = rawModel;
         }
 
-        // 打印材质信息
+        _lastSpawnRoot = rootForState;
+
         DumpMaterials(rawModel);
     }
 
-
-
-    // 隐藏 wrapper 里所有“不属于模型本身”的 Renderer（包括 Cube）
     void HideWrapperVisuals(GameObject wrapper, GameObject rawModel)
     {
         var renderers = wrapper.GetComponentsInChildren<Renderer>(true);
@@ -643,7 +1272,6 @@ public class MeshyInteractive3DGenerator : MonoBehaviour
         float scale = targetSizeMeters / max;
         go.transform.localScale *= scale;
 
-        // Sit on ground (bottom at y = 0)
         b = ComputeWorldBounds(go);
         go.transform.position -= new Vector3(0, b.min.y, 0);
     }
